@@ -7,33 +7,30 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 import json
 import uuid
+import winreg
 
 # Configure logging
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class WindowsError(IntEnum):
     """Windows error codes"""
     ERROR_SUCCESS = 0
+    ERROR_FILE_NOT_FOUND = 2
     ERROR_INSUFFICIENT_BUFFER = 122
     ERROR_NO_MORE_ITEMS = 259
     ERROR_OUTOFMEMORY = 14
 
-
-class FormatMessageFlags(IntEnum):
-    """FormatMessage API flags"""
-    FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000
-    FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200
-    FORMAT_MESSAGE_MAX_WIDTH_MASK = 0x000000FF
-
     @property
     def name(self):
         return {
-            self.FORMAT_MESSAGE_FROM_SYSTEM: "Format Message From System",
-            self.FORMAT_MESSAGE_IGNORE_INSERTS: "Format Message Ignore Inserts",
-            self.FORMAT_MESSAGE_MAX_WIDTH_MASK: "Format Message Max Width Mask",
-        }
+            self.ERROR_SUCCESS: "ERROR_SUCCESS",
+            self.ERROR_FILE_NOT_FOUND: "ERROR_FILE_NOT_FOUND",
+            self.ERROR_INSUFFICIENT_BUFFER: "ERROR_INSUFFICIENT_BUFFER",
+            self.ERROR_NO_MORE_ITEMS: "ERROR_NO_MORE_ITEMS",
+            self.ERROR_OUTOFMEMORY: "ERROR_OUTOFMEMORY"
+        }[self]
 
 
 class EvtFormatMessageFlags(IntEnum):
@@ -364,11 +361,83 @@ class WindowsEventMetadataAPI:
         self._ole32.StringFromGUID2.argtypes = [
             ctypes.POINTER(ctypes.c_byte * 16), LPWSTR, ctypes.c_int
         ]
+    
+    def get_provider_guid_from_name(self, provider_name: str) -> Optional[str]:
+        """
+        Get provider GUID from provider name by searching the registry.
         
-        self._kernel32.FormatMessageW.restype = DWORD
-        self._kernel32.FormatMessageW.argtypes = [
-            DWORD, ctypes.c_void_p, DWORD, DWORD, LPWSTR, DWORD, ctypes.c_void_p
-        ]
+        Args:
+            provider_name: Provider name
+            
+        Returns:
+            Provider GUID string or None if not found
+        """
+        try:
+            publishers_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Publishers"
+            
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, publishers_path) as publishers_key:
+                i = 0
+                while True:
+                    try:
+                        # Enumerate subkeys (GUIDs)
+                        guid = winreg.EnumKey(publishers_key, i)
+                        
+                        # Open the GUID subkey and check if it matches our provider
+                        with winreg.OpenKey(publishers_key, guid) as guid_key:
+                            try:
+                                # Read the default value (provider name)
+                                name, _ = winreg.QueryValueEx(guid_key, None)
+                                if name == provider_name:
+                                    return guid
+                            except OSError:
+                                pass
+                        
+                        i += 1
+                    except OSError:
+                        # No more subkeys
+                        break
+                        
+        except OSError as e:
+            logger.debug(f"Could not search registry for provider {provider_name}: {e}")
+            
+        return None
+    
+    def get_provider_registry_info(self, provider_guid: str) -> Dict[str, str]:
+        """
+        Query the Windows registry for provider file paths.
+        
+        Args:
+            provider_guid: Provider GUID string
+            
+        Returns:
+            Dictionary containing ResourceFileName, MessageFileName, and ParameterFileName
+        """
+        registry_info = {
+            'ResourceFileName': None,
+            'MessageFileName': None, 
+            'ParameterFileName': None
+        }
+        
+        try:
+            # Construct registry path
+            registry_path = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Publishers\{provider_guid}"
+            
+            # Open registry key
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, registry_path) as key:
+                # Try to read each value
+                for value_name in ['ResourceFileName', 'MessageFileName', 'ParameterFileName']:
+                    try:
+                        value, _ = winreg.QueryValueEx(key, value_name)
+                        registry_info[value_name] = value
+                    except OSError:
+                        # Value doesn't exist
+                        pass
+                        
+        except OSError as e:
+            # Registry key doesn't exist or access denied
+            logger.debug(f"Could not access registry for provider {provider_guid}: {e}")
+            
+        return registry_info
     
     def open_publisher_metadata(self, publisher_name: str, 
                               session: Optional[HANDLE] = None,
@@ -400,10 +469,40 @@ class WindowsEventMetadataAPI:
         
         if not handle:
             error_code = self._kernel32.GetLastError()
-            error_message = self.format_error_message(error_code)
-            raise EventMetadataError(
-                f"EvtOpenPublisherMetadata failed for '{publisher_name}'. {error_message}"
-            )
+            error_msg = f"EvtOpenPublisherMetadata failed for '{publisher_name}'. Error code: {error_code}"
+            
+            # If error is FILE_NOT_FOUND (0x2), try to get file paths from registry
+            if error_code == WindowsError.ERROR_FILE_NOT_FOUND:
+                # Try to get provider GUID
+                provider_guid = self.get_provider_guid_from_name(publisher_name)
+                
+                if provider_guid:
+                    # Get file paths from registry
+                    registry_info = self.get_provider_registry_info(provider_guid)
+                    
+                    # Build detailed error message
+                    error_msg += "\n\nMissing provider metadata files:"
+                    
+                    if registry_info['ResourceFileName']:
+                        error_msg += f"\n  ResourceFileName: {registry_info['ResourceFileName']}"
+                    else:
+                        error_msg += "\n  ResourceFileName: (not specified in registry)"
+                        
+                    if registry_info['MessageFileName']:
+                        error_msg += f"\n  MessageFileName: {registry_info['MessageFileName']}"
+                    else:
+                        error_msg += "\n  MessageFileName: (not specified in registry)"
+                        
+                    if registry_info['ParameterFileName']:
+                        error_msg += f"\n  ParameterFileName: {registry_info['ParameterFileName']}"
+                    else:
+                        error_msg += "\n  ParameterFileName: (not specified in registry)"
+                        
+                    error_msg += f"\n\nRegistry path: HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WINEVT\\Publishers\\{provider_guid}"
+                else:
+                    error_msg += "\n\nCould not find provider GUID in registry to retrieve file paths."
+            
+            raise EventMetadataError(error_msg)
         
         return handle
     
@@ -413,7 +512,7 @@ class WindowsEventMetadataAPI:
             self._wevtapi.EvtClose(handle)
     
     def get_publisher_metadata_property(self, handle: HANDLE, 
-                                      property_id: int,
+                                      property_id: EvtPublisherMetadataPropertyId,
                                       flags: int = 0) -> Optional[EvtVariant]:
         """
         Get a publisher metadata property.
@@ -437,8 +536,6 @@ class WindowsEventMetadataAPI:
         if not result:
             error_code = self._kernel32.GetLastError()
             if error_code != WindowsError.ERROR_INSUFFICIENT_BUFFER:
-                error_message = self.format_error_message(error_code)
-                logger.error(f"EvtGetPublisherMetadataProperty failed: {error_message}")
                 return None
             
             buffer_size = buffer_used
@@ -457,47 +554,10 @@ class WindowsEventMetadataAPI:
         
         if not result:
             error_code = self._kernel32.GetLastError()
-            error_message = self.format_error_message(error_code)
-            logger.error(f"EvtGetPublisherMetadataProperty failed: {error_message}")
+            logger.error(f"EvtGetPublisherMetadataProperty '{property_id.name}' failed with error {error_code}")
             return None
         
         return evt_variant
-    
-    def format_error_message(self, error_code: int) -> str:
-        """
-        Format a Windows error code into a human-readable error message.
-        
-        Args:
-            error_code: Windows error code to format
-            
-        Returns:
-            Formatted error message string
-        """
-        buffer_size = 1024
-        buffer = ctypes.create_unicode_buffer(buffer_size)
-        
-        # Use FORMAT_MESSAGE_FROM_SYSTEM to get system error messages
-        # FORMAT_MESSAGE_IGNORE_INSERTS to avoid parameter substitution issues
-        flags = (FormatMessageFlags.FORMAT_MESSAGE_FROM_SYSTEM | 
-                FormatMessageFlags.FORMAT_MESSAGE_IGNORE_INSERTS)
-        
-        result = self._kernel32.FormatMessageW(
-            flags,          # dwFlags
-            None,           # lpSource
-            error_code,     # dwMessageId
-            0,              # dwLanguageId (0 = default language)
-            buffer,         # lpBuffer
-            buffer_size,    # nSize
-            None            # Arguments
-        )
-        
-        if result > 0:
-            # Remove trailing whitespace (FormatMessage often adds \r\n)
-            message = buffer.value.rstrip()
-            return f"Error {error_code} (0x{error_code:08X}): {message}"
-        else:
-            # If FormatMessage fails, return a basic error message
-            return f"Error {error_code} (0x{error_code:08X}): Unknown error"
     
     def format_message(self, metadata_handle: HANDLE, message_id: int,
                       event_handle: Optional[HANDLE] = None,
@@ -530,8 +590,7 @@ class WindowsEventMetadataAPI:
         if not result:
             error_code = self._kernel32.GetLastError()
             if error_code != WindowsError.ERROR_INSUFFICIENT_BUFFER:
-                error_message = self.format_error_message(error_code)
-                logger.error(f"EvtFormatMessage failed: {error_message}")
+                logger.error(f"EvtFormatMessage failed with error {error_code}")
                 return None
             
             buffer_size = buffer_used
@@ -549,8 +608,7 @@ class WindowsEventMetadataAPI:
         
         if not result:
             error_code = self._kernel32.GetLastError()
-            error_message = self.format_error_message(error_code)
-            logger.error(f"EvtFormatMessage failed: {error_message}")
+            logger.error(f"EvtFormatMessage failed with error {error_code}")
             return None
         
         return buffer.value
@@ -569,8 +627,7 @@ class WindowsEventMetadataAPI:
         handle = self._wevtapi.EvtOpenEventMetadataEnum(metadata_handle, flags)
         if not handle:
             error_code = self._kernel32.GetLastError()
-            error_message = self.format_error_message(error_code)
-            logger.error(f"EvtOpenEventMetadataEnum failed: {error_message}")
+            logger.error(f"EvtOpenEventMetadataEnum failed with error {error_code}")
             return None
         return handle
     
@@ -589,8 +646,7 @@ class WindowsEventMetadataAPI:
         if not handle:
             error_code = self._kernel32.GetLastError()
             if error_code != WindowsError.ERROR_NO_MORE_ITEMS:
-                error_message = self.format_error_message(error_code)
-                logger.error(f"EvtNextEventMetadata failed: {error_message}")
+                logger.error(f"EvtNextEventMetadata failed with error {error_code}")
             return None
         return handle
     
@@ -619,8 +675,7 @@ class WindowsEventMetadataAPI:
         if not result:
             error_code = self._kernel32.GetLastError()
             if error_code != WindowsError.ERROR_INSUFFICIENT_BUFFER:
-                error_message = self.format_error_message(error_code)
-                logger.error(f"EvtGetEventMetadataProperty failed: {error_message}")
+                logger.error(f"EvtGetEventMetadataProperty failed to get {property_id.name} with error {error_code}")
                 return None
             
             buffer_size = buffer_used
@@ -639,8 +694,7 @@ class WindowsEventMetadataAPI:
         
         if not result:
             error_code = self._kernel32.GetLastError()
-            error_message = self.format_error_message(error_code)
-            logger.error(f"EvtGetEventMetadataProperty failed: {error_message}")
+            logger.error(f"EvtGetEventMetadataProperty failed to get {property_id.name} with error {error_code}")
             return None
         
         return evt_variant
@@ -652,8 +706,7 @@ class WindowsEventMetadataAPI:
         
         if not result:
             error_code = self._kernel32.GetLastError()
-            error_message = self.format_error_message(error_code)
-            logger.error(f"EvtGetObjectArraySize failed: {error_message}")
+            logger.error(f"EvtGetObjectArraySize failed with error {error_code}")
             return None
             
         return array_size.value
@@ -692,8 +745,7 @@ class WindowsEventMetadataAPI:
         if not result:
             error_code = self._kernel32.GetLastError()
             if error_code != WindowsError.ERROR_INSUFFICIENT_BUFFER:
-                error_message = self.format_error_message(error_code)
-                logger.error(f"EvtGetObjectArrayProperty failed: {error_message}")
+                logger.error(f"EvtGetObjectArrayProperty failed to get {property_id.name} with error {error_code}")
                 return None
             
             buffer_size = buffer_used
@@ -712,8 +764,7 @@ class WindowsEventMetadataAPI:
         
         if not result:
             error_code = self._kernel32.GetLastError()
-            error_message = self.format_error_message(error_code)
-            logger.error(f"EvtGetObjectArrayProperty failed: {error_message}")
+            logger.error(f"EvtGetObjectArrayProperty failed to get {property_id.name} with error {error_code}")
             return None
         
         return evt_variant
@@ -1102,10 +1153,7 @@ class EventMetadataEnumerator:
                     message = self._get_message_string(metadata_handle, variant.value.UInt32Val)
                 logger.info(f"\tChannel message string: {message or '(empty)'}")
             else:
-                error_code = self._api._kernel32.GetLastError()
-                error_message = self._api.format_error_message(error_code)
-                logger.error(f"Failed to get channel message ID: {error_message}")
-                return error_code
+                return self._api._kernel32.GetLastError()
             
             # Get channel path
             variant = self._api.get_object_array_property(
@@ -1623,8 +1671,7 @@ class EventMetadataEnumerator:
                         if error_code == WindowsError.ERROR_NO_MORE_ITEMS:
                             break
                         else:
-                            error_message = self._api.format_error_message(error_code)
-                            logger.error(f"EvtNextEventMetadata failed: {error_message}")
+                            logger.error(f"EvtNextEventMetadata failed with error {error_code}")
                             return error_code
                     
                     try:
@@ -1658,6 +1705,18 @@ class EventMetadataEnumerator:
         metadata.opcode_messages.messages.clear()
         metadata.keyword_messages.messages.clear()
     
+    def _get_opcode_name(self, handle: HANDLE, messages: Messages,
+                        opcode_value: int, task_value: int) -> Optional[str]:
+        """Get opcode name (placeholder)"""
+        # TODO: Implement when GetOpcodeName is provided
+        return None
+    
+    def _get_keyword_name(self, handle: HANDLE, messages: Messages,
+                         keyword: int) -> Optional[str]:
+        """Get keyword name (placeholder)"""
+        # TODO: Implement when GetKeywordName is provided
+        return None
+    
     def _get_message_string(self, metadata_handle: HANDLE, message_id: int) -> Optional[str]:
         """
         Get formatted message string by ID.
@@ -1675,11 +1734,7 @@ class EventMetadataEnumerator:
 
 
 def main():
-    """
-    Example usage of the event metadata enumerator.
-    
-    Enhanced with detailed Windows error message formatting using FormatMessage API.
-    """
+    """Example usage of the event metadata enumerator"""
     try:
         enumerator = EventMetadataEnumerator()
         
@@ -1689,7 +1744,7 @@ def main():
         
         # Convert to JSON for output
         json_output = json.dumps(metadata, indent=2)
-        print(json_output)
+        # print(json_output)
         
     except EventMetadataError as e:
         logger.error(f"Metadata error: {e}")
