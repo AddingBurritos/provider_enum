@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 import json
 import uuid
+import winreg
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 class WindowsError(IntEnum):
     """Windows error codes"""
     ERROR_SUCCESS = 0
+    ERROR_FILE_NOT_FOUND = 2
     ERROR_INSUFFICIENT_BUFFER = 122
     ERROR_NO_MORE_ITEMS = 259
     ERROR_OUTOFMEMORY = 14
@@ -24,6 +26,7 @@ class WindowsError(IntEnum):
     def name(self):
         return {
             self.ERROR_SUCCESS: "ERROR_SUCCESS",
+            self.ERROR_FILE_NOT_FOUND: "ERROR_FILE_NOT_FOUND",
             self.ERROR_INSUFFICIENT_BUFFER: "ERROR_INSUFFICIENT_BUFFER",
             self.ERROR_NO_MORE_ITEMS: "ERROR_NO_MORE_ITEMS",
             self.ERROR_OUTOFMEMORY: "ERROR_OUTOFMEMORY"
@@ -359,6 +362,83 @@ class WindowsEventMetadataAPI:
             ctypes.POINTER(ctypes.c_byte * 16), LPWSTR, ctypes.c_int
         ]
     
+    def get_provider_guid_from_name(self, provider_name: str) -> Optional[str]:
+        """
+        Get provider GUID from provider name by searching the registry.
+        
+        Args:
+            provider_name: Provider name
+            
+        Returns:
+            Provider GUID string or None if not found
+        """
+        try:
+            publishers_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Publishers"
+            
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, publishers_path) as publishers_key:
+                i = 0
+                while True:
+                    try:
+                        # Enumerate subkeys (GUIDs)
+                        guid = winreg.EnumKey(publishers_key, i)
+                        
+                        # Open the GUID subkey and check if it matches our provider
+                        with winreg.OpenKey(publishers_key, guid) as guid_key:
+                            try:
+                                # Read the default value (provider name)
+                                name, _ = winreg.QueryValueEx(guid_key, None)
+                                if name == provider_name:
+                                    return guid
+                            except OSError:
+                                pass
+                        
+                        i += 1
+                    except OSError:
+                        # No more subkeys
+                        break
+                        
+        except OSError as e:
+            logger.debug(f"Could not search registry for provider {provider_name}: {e}")
+            
+        return None
+    
+    def get_provider_registry_info(self, provider_guid: str) -> Dict[str, str]:
+        """
+        Query the Windows registry for provider file paths.
+        
+        Args:
+            provider_guid: Provider GUID string
+            
+        Returns:
+            Dictionary containing ResourceFileName, MessageFileName, and ParameterFileName
+        """
+        registry_info = {
+            'ResourceFileName': None,
+            'MessageFileName': None, 
+            'ParameterFileName': None
+        }
+        
+        try:
+            # Construct registry path
+            registry_path = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Publishers\{provider_guid}"
+            
+            # Open registry key
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, registry_path) as key:
+                # Try to read each value
+                for value_name in ['ResourceFileName', 'MessageFileName', 'ParameterFileName']:
+                    try:
+                        value, _ = winreg.QueryValueEx(key, value_name)
+                        registry_info[value_name] = value
+                    except OSError:
+                        # Value doesn't exist
+                        pass
+                        
+        except OSError as e:
+            # Registry key doesn't exist or access denied
+            logger.debug(f"Could not access registry for provider {provider_guid}: {e}")
+            
+        return registry_info
+    
     def open_publisher_metadata(self, publisher_name: str, 
                               session: Optional[HANDLE] = None,
                               log_file_path: Optional[str] = None,
@@ -389,9 +469,40 @@ class WindowsEventMetadataAPI:
         
         if not handle:
             error_code = self._kernel32.GetLastError()
-            raise EventMetadataError(
-                f"EvtOpenPublisherMetadata failed for '{publisher_name}'. Error code: {error_code}"
-            )
+            error_msg = f"EvtOpenPublisherMetadata failed for '{publisher_name}'. Error code: {error_code}"
+            
+            # If error is FILE_NOT_FOUND (0x2), try to get file paths from registry
+            if error_code == WindowsError.ERROR_FILE_NOT_FOUND:
+                # Try to get provider GUID
+                provider_guid = self.get_provider_guid_from_name(publisher_name)
+                
+                if provider_guid:
+                    # Get file paths from registry
+                    registry_info = self.get_provider_registry_info(provider_guid)
+                    
+                    # Build detailed error message
+                    error_msg += "\n\nMissing provider metadata files:"
+                    
+                    if registry_info['ResourceFileName']:
+                        error_msg += f"\n  ResourceFileName: {registry_info['ResourceFileName']}"
+                    else:
+                        error_msg += "\n  ResourceFileName: (not specified in registry)"
+                        
+                    if registry_info['MessageFileName']:
+                        error_msg += f"\n  MessageFileName: {registry_info['MessageFileName']}"
+                    else:
+                        error_msg += "\n  MessageFileName: (not specified in registry)"
+                        
+                    if registry_info['ParameterFileName']:
+                        error_msg += f"\n  ParameterFileName: {registry_info['ParameterFileName']}"
+                    else:
+                        error_msg += "\n  ParameterFileName: (not specified in registry)"
+                        
+                    error_msg += f"\n\nRegistry path: HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WINEVT\\Publishers\\{provider_guid}"
+                else:
+                    error_msg += "\n\nCould not find provider GUID in registry to retrieve file paths."
+            
+            raise EventMetadataError(error_msg)
         
         return handle
     
@@ -1633,7 +1744,7 @@ def main():
         
         # Convert to JSON for output
         json_output = json.dumps(metadata, indent=2)
-        print(json_output)
+        # print(json_output)
         
     except EventMetadataError as e:
         logger.error(f"Metadata error: {e}")
