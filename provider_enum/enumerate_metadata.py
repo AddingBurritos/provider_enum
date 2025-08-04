@@ -413,7 +413,7 @@ class WindowsEventMetadataAPI:
             self._wevtapi.EvtClose(handle)
     
     def get_publisher_metadata_property(self, handle: HANDLE, 
-                                      property_id: int,
+                                      property_id: EvtPublisherMetadataPropertyId,
                                       flags: int = 0) -> Optional[EvtVariant]:
         """
         Get a publisher metadata property.
