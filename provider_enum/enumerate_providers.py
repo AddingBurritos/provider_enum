@@ -128,7 +128,7 @@ class EventProviderEnumerator:
         try:
             with self._api.publisher_enumeration() as handle:
                 for provider_name in self._iterate_publishers(handle):
-                    providers.append(EventProvider(provider_name))
+                    providers.append(provider_name)
         except Exception as e:
             logger.error(f"Failed to enumerate event providers: {e}")
             raise WindowsEventProviderError(f"Enumeration failed: {e}") from e
